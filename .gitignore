@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Secrets and local config (keep the example)
+.env
+.env.*
+!.env.example
+
+# Local tooling
+*.log
+*.pid
+.sqlx/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local Postgres data if you bind-mount it instead of using the named volume
+/pgdata/
+/data/

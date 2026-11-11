@@ -1,0 +1,18 @@
+# Local Postgres for development: docker compose up -d
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: distanplay
+      POSTGRES_PASSWORD: distanplay
+      POSTGRES_DB: distanplay
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U distanplay"]
+      interval: 2s
+      retries: 30
+volumes:
+  pgdata:
