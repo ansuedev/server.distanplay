@@ -116,6 +116,8 @@ pub struct Hub {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     Connect { device_id: Uuid },
+    /// Connect with a device's code + password (anyone signed in, no friendship needed).
+    ConnectCode { code: String, password: String },
     Cancel { request_id: Uuid },
     Respond { request_id: Uuid, accept: bool },
     Candidates { session_id: Uuid, candidates: Vec<Candidate> },
@@ -332,6 +334,13 @@ async fn handle(state: &AppState, user: &AuthUser, device: Uuid, tx: &mpsc::Unbo
             }
         }
 
+        ClientMsg::ConnectCode { code, password } => {
+            if let Err(e) = connect_code(state, user, device, &code, &password, &reply).await {
+                tracing::warn!("connect_code: {e}");
+                reply(json!({ "type": "connect_failed", "reason": "error" }));
+            }
+        }
+
         ClientMsg::Cancel { request_id } => {
             if let Some((_, p)) = state.hub.pending.remove_if(&request_id, |_, p| p.viewer_device == device) {
                 let _ = sqlx::query("UPDATE connection_requests SET status = 'canceled', responded_at = now() WHERE id = $1")
@@ -518,6 +527,95 @@ async fn connect(
         }
     });
     Ok(())
+}
+
+async fn connect_code(
+    state: &AppState,
+    user: &AuthUser,
+    my_device: Uuid,
+    code: &str,
+    password: &str,
+    reply: &impl Fn(serde_json::Value),
+) -> ApiResult<()> {
+    let fail = |reason: &str, extra: serde_json::Value| {
+        let mut m = json!({ "type": "connect_failed", "reason": reason });
+        if let (Some(o), Some(e)) = (m.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        reply(m)
+    };
+    let Some(code) = crate::routes::access::normalize_code(code) else {
+        fail("wrong_credentials", json!({}));
+        return Ok(());
+    };
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        device_id: Uuid,
+        user_id: Uuid,
+        password_hash: String,
+        failed_attempts: i32,
+        locked_secs: Option<i64>,
+    }
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT a.device_id, a.user_id, a.password_hash, a.failed_attempts,
+                CASE WHEN a.locked_until > now() THEN EXTRACT(EPOCH FROM (a.locked_until - now()))::bigint END AS locked_secs
+         FROM device_access a JOIN devices d ON d.id = a.device_id
+         WHERE a.code = $1 AND d.revoked_at IS NULL",
+    )
+    .bind(&code)
+    .fetch_optional(&state.db)
+    .await?;
+    // Same answer (and timing) for an unknown code and a wrong password.
+    let Some(r) = row else {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        fail("wrong_credentials", json!({}));
+        return Ok(());
+    };
+    if let Some(secs) = r.locked_secs {
+        fail("locked", json!({ "retry_in": secs.max(1) }));
+        return Ok(());
+    }
+    if !crate::routes::access::verify(password.trim().to_string(), r.password_hash).await {
+        // 5 wrong tries lock the code: 30 s, then doubling up to 10 minutes.
+        let n = r.failed_attempts + 1;
+        let lock = if n >= 5 { Some((30i64 << (n - 5).min(5)).min(600)) } else { None };
+        sqlx::query(
+            "UPDATE device_access SET failed_attempts = $2,
+                locked_until = CASE WHEN $3::bigint IS NULL THEN NULL ELSE now() + make_interval(secs => $3::bigint) END
+             WHERE device_id = $1",
+        )
+        .bind(r.device_id)
+        .bind(n)
+        .bind(lock)
+        .execute(&state.db)
+        .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        fail("wrong_credentials", json!({}));
+        return Ok(());
+    }
+    sqlx::query("UPDATE device_access SET failed_attempts = 0, locked_until = NULL WHERE device_id = $1")
+        .bind(r.device_id)
+        .execute(&state.db)
+        .await?;
+    if r.device_id == my_device {
+        fail("self", json!({}));
+        return Ok(());
+    }
+    if !state.hub.is_online(r.device_id) {
+        fail("offline", json!({}));
+        return Ok(());
+    }
+    let request_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO connection_requests (viewer_user_id, viewer_device_id, host_user_id, host_device_id, status, expires_at, responded_at)
+         VALUES ($1, $2, $3, $4, 'auto_approved', now(), now()) RETURNING id",
+    )
+    .bind(user.user_id)
+    .bind(my_device)
+    .bind(r.user_id)
+    .bind(r.device_id)
+    .fetch_one(&state.db)
+    .await?;
+    start_session(state, Some(request_id), user.user_id, my_device, r.user_id, r.device_id).await
 }
 
 async fn start_session(

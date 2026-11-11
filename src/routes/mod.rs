@@ -1,3 +1,4 @@
+pub mod access;
 pub mod admin;
 pub mod friends;
 pub mod library;

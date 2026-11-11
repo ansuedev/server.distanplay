@@ -58,11 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = config::Config::from_env()?;
-    let db = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(&cfg.database_url)
-        .await?;
+    let db = connect_db(&cfg.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     tracing::info!("database ready");
 
@@ -91,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/me/devices", get(routes::me::devices))
         .route("/me/devices/{id}", patch(routes::me::rename_device).delete(routes::me::remove_device))
         .route("/users/by-username/{username}", get(routes::me::find_user))
+        .route("/me/access", get(routes::access::get))
+        .route("/me/access/rotate", post(routes::access::rotate))
+        .route("/me/access/password", put(routes::access::set_password))
         // friends
         .route("/friends", get(routes::friends::list))
         .route("/friends/requests", post(routes::friends::request))
@@ -201,6 +200,44 @@ async fn dev_login(State(state): State<AppState>, Json(b): Json<DevLogin>) -> Ap
         "access_token": t.access_token, "refresh_token": t.refresh_token, "device_id": device,
         "me": routes::me::load_me(&state.db, uid).await?,
     })))
+}
+
+/// Connects to Postgres, retrying for a minute (the database may still be starting),
+/// and logs the real reason when it can't (wrong host, refused, bad password…).
+async fn connect_db(url: &str) -> anyhow::Result<sqlx::PgPool> {
+    use sqlx::ConnectOptions;
+    let opts: sqlx::postgres::PgConnectOptions =
+        url.parse().map_err(|e| anyhow::anyhow!("DATABASE_URL isn't a valid postgres:// URL: {e}"))?;
+    let target = format!("{}:{}/{}", opts.get_host(), opts.get_port(), opts.get_database().unwrap_or("(default)"));
+    if matches!(opts.get_host(), "localhost" | "127.0.0.1" | "::1") && std::env::var_os("RAILWAY_ENVIRONMENT").is_some() {
+        tracing::error!(
+            "DATABASE_URL points to {target}, which is this container, not your database. \
+             On Railway set DATABASE_URL to ${{{{Postgres.DATABASE_URL}}}}"
+        );
+    }
+    tracing::info!("connecting to database at {target}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        // One direct connection first: its error says what's actually wrong.
+        match opts.connect().await {
+            Ok(c) => {
+                drop(c);
+                break;
+            }
+            Err(e) if std::time::Instant::now() < deadline => {
+                tracing::warn!("database not reachable yet (attempt {attempt}): {e}");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Err(e) => anyhow::bail!("can't connect to the database at {target}: {e}"),
+        }
+    }
+    Ok(PgPoolOptions::new()
+        .max_connections(20)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(opts)
+        .await?)
 }
 
 async fn health(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
