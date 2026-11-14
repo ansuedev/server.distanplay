@@ -118,6 +118,8 @@ enum ClientMsg {
     Connect { device_id: Uuid },
     /// Connect with a device's code + password (anyone signed in, no friendship needed).
     ConnectCode { code: String, password: String },
+    /// Connect with an invite link's token (`/j/<token>`, from Discord or a profile).
+    ConnectInvite { token: String },
     Cancel { request_id: Uuid },
     Respond { request_id: Uuid, accept: bool },
     Candidates { session_id: Uuid, candidates: Vec<Candidate> },
@@ -150,6 +152,11 @@ impl Hub {
         if let Some(c) = self.devices.get(&device) {
             let _ = c.tx.send(Message::Text(Utf8Bytes::from(v.to_string())));
         }
+    }
+
+    /// A user's devices connected right now.
+    pub fn online_devices(&self, user: Uuid) -> Vec<Uuid> {
+        self.user_devices(user)
     }
 
     fn user_devices(&self, user: Uuid) -> Vec<Uuid> {
@@ -341,6 +348,13 @@ async fn handle(state: &AppState, user: &AuthUser, device: Uuid, tx: &mpsc::Unbo
             }
         }
 
+        ClientMsg::ConnectInvite { token } => {
+            if let Err(e) = connect_invite(state, user, device, &token, &reply).await {
+                tracing::warn!("connect_invite: {e}");
+                reply(json!({ "type": "connect_failed", "reason": "error" }));
+            }
+        }
+
         ClientMsg::Cancel { request_id } => {
             if let Some((_, p)) = state.hub.pending.remove_if(&request_id, |_, p| p.viewer_device == device) {
                 let _ = sqlx::query("UPDATE connection_requests SET status = 'canceled', responded_at = now() WHERE id = $1")
@@ -464,6 +478,42 @@ async fn connect(
         return Ok(());
     }
     let auto = own || permissions_for(&state.db, owner, user.user_id).await?.connect_without_approval;
+    request_connection(state, user, my_device, owner, target, auto, reply).await
+}
+
+/// An invite link: whoever it's for (or anyone, for an open invite) may connect.
+async fn connect_invite(
+    state: &AppState,
+    user: &AuthUser,
+    my_device: Uuid,
+    token: &str,
+    reply: &impl Fn(serde_json::Value),
+) -> ApiResult<()> {
+    match crate::routes::invites::redeem(state, token, user.user_id, my_device).await? {
+        Err(reason) => {
+            reply(json!({ "type": "connect_failed", "reason": reason }));
+            Ok(())
+        }
+        Ok(r) => {
+            // A friend who may connect without asking doesn't need approval either.
+            let auto = r.auto
+                || (are_friends(&state.db, user.user_id, r.host_user).await?
+                    && permissions_for(&state.db, r.host_user, user.user_id).await?.connect_without_approval);
+            request_connection(state, user, my_device, r.host_user, r.host_device, auto, reply).await
+        }
+    }
+}
+
+/// Starts the session right away (`auto`) or asks the host's app, which shows a prompt.
+async fn request_connection(
+    state: &AppState,
+    user: &AuthUser,
+    my_device: Uuid,
+    owner: Uuid,
+    target: Uuid,
+    auto: bool,
+    reply: &impl Fn(serde_json::Value),
+) -> ApiResult<()> {
     let request_id: Uuid = sqlx::query_scalar(
         "INSERT INTO connection_requests (viewer_user_id, viewer_device_id, host_user_id, host_device_id, status, expires_at, responded_at)
          VALUES ($1, $2, $3, $4, $5::connection_request_status, now() + interval '60 seconds', CASE WHEN $5 = 'auto_approved' THEN now() END)

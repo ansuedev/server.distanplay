@@ -25,6 +25,11 @@ pub struct Config {
     pub udp_relay: Option<String>,
     /// Allow the relay over WebSocket (TCP) as the last resort.
     pub ws_relay: bool,
+    /// Discord app public key (hex, General Information → Public Key): turns on the
+    /// `/jugar` bot at `POST /discord/interactions`.
+    pub discord_public_key: Option<[u8; 32]>,
+    /// Where invites send people who don't have the app yet.
+    pub download_url: Option<String>,
 }
 
 fn var(name: &str) -> Result<String> {
@@ -66,6 +71,14 @@ impl Config {
                 .collect(),
             udp_relay: std::env::var("UDP_RELAY").ok().filter(|s| !s.trim().is_empty()),
             ws_relay: std::env::var("WS_RELAY").map(|v| v != "0" && v != "false").unwrap_or(true),
+            discord_public_key: match std::env::var("DISCORD_PUBLIC_KEY").ok().filter(|s| !s.trim().is_empty()) {
+                Some(k) => Some(
+                    crate::discord_bot::hex32(&k)
+                        .context("DISCORD_PUBLIC_KEY must be the 64 hex characters from the Discord app's General Information page")?,
+                ),
+                None => None,
+            },
+            download_url: std::env::var("DOWNLOAD_URL").ok().map(|s| s.trim().to_string()).filter(|s| s.starts_with("https://")),
         })
     }
 

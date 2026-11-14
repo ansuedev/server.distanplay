@@ -4,6 +4,7 @@
 
 mod auth;
 mod config;
+mod discord_bot;
 mod limit;
 mod error;
 mod hub;
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         db,
     };
     tokio::spawn(housekeeping(state.clone()));
+    tokio::spawn(discord_bot::register_commands(state.clone()));
 
     let api = Router::new()
         // auth
@@ -90,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/me/access", get(routes::access::get))
         .route("/me/access/rotate", post(routes::access::rotate))
         .route("/me/access/password", put(routes::access::set_password))
+        // invites
+        .route("/invites", post(routes::invites::create_route))
+        .route("/invites/{key}", get(routes::invites::preview_route).delete(routes::invites::revoke_route))
         // friends
         .route("/friends", get(routes::friends::list))
         .route("/friends/requests", post(routes::friends::request))
@@ -119,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
         .nest("/v1", api)
         .route("/", get(|| async { "Distanplay server" }))
         .route("/healthz", get(health))
+        .route("/j/{token}", get(routes::invites::page_route))
+        .route("/brand/icon.png", get(routes::invites::icon))
+        .route("/discord/interactions", post(discord_bot::interactions))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(
@@ -253,6 +261,10 @@ async fn public_config(State(state): State<AppState>) -> Json<serde_json::Value>
         "relay": { "ws": state.cfg.ws_relay, "udp": state.cfg.udp_relay },
         "ticket_public_key": base64::engine::general_purpose::STANDARD.encode(state.ticket_key.verifying_key().to_bytes()),
         "providers": ["discord"],
+        // Public: the app uses it to show "Playing Distanplay" with a Join button on Discord.
+        "discord_client_id": state.cfg.discord_client_id,
+        "bot": state.cfg.discord_public_key.is_some(),
+        "download_url": state.cfg.download_url,
     }))
 }
 
@@ -303,6 +315,7 @@ async fn housekeeping(state: AppState) {
             )
             .execute(&state.db)
             .await?;
+            sqlx::query("DELETE FROM invites WHERE expires_at < now() - interval '7 days'").execute(&state.db).await?;
             sqlx::query("UPDATE connection_requests SET status = 'expired' WHERE status = 'pending' AND expires_at < now()")
                 .execute(&state.db)
                 .await?;
