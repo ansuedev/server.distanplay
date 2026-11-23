@@ -161,7 +161,11 @@ pub struct AddFriend {
 /// Sends a request by exact username. If they already asked you, you become friends.
 pub async fn request(State(state): State<AppState>, user: AuthUser, Json(req): Json<AddFriend>) -> ApiResult<Json<serde_json::Value>> {
     let name = req.username.trim().trim_start_matches('@').to_lowercase();
-    let target: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1 AND status = 'active'")
+    let guest: bool = sqlx::query_scalar("SELECT is_guest FROM users WHERE id = $1").bind(user.user_id).fetch_one(&state.db).await?;
+    if guest {
+        return Err(bad("guest", "Sign in with Discord to add friends."));
+    }
+    let target: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1 AND status = 'active' AND NOT is_guest")
         .bind(&name)
         .fetch_optional(&state.db)
         .await?;

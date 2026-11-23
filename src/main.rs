@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/discord/callback", get(auth::discord::callback))
         .route("/auth/poll", post(auth::discord::poll))
         .route("/auth/refresh", post(refresh))
+        .route("/auth/guest", post(guest_login))
         .merge(dev_routes())
         .route("/auth/logout", post(logout))
         .route("/auth/sessions", get(routes::me::sessions))
@@ -269,6 +270,67 @@ async fn public_config(State(state): State<AppState>) -> Json<serde_json::Value>
 }
 
 #[derive(Deserialize)]
+struct GuestLogin {
+    install_id: uuid::Uuid,
+    device_name: String,
+    #[serde(default)]
+    platform: String,
+    /// The name the host sees in "… wants to connect" (defaults to the device name).
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// `POST /v1/auth/guest` — uses the app without an account: connecting by code,
+/// password or link only (no friends). Makes a hidden account for this install.
+async fn guest_login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(b): Json<GuestLogin>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ip = client_ip(&headers, addr);
+    state.limits.check("guest", ip, 5)?;
+    let clip = |s: &str, n: usize| s.trim().chars().filter(|c| !c.is_control()).take(n).collect::<String>();
+    let device_name = Some(clip(&b.device_name, 64)).filter(|s| !s.is_empty()).unwrap_or_else(|| "PC".into());
+    let display = b
+        .display_name
+        .as_deref()
+        .map(|s| clip(s, 32))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| clip(&device_name, 32));
+    let uname = format!("guest_{}", auth::random_token("").to_lowercase().replace(['-', '_'], "").chars().take(12).collect::<String>());
+    let mut tx = state.db.begin().await?;
+    let uid: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username, display_name, is_guest, last_login_at) VALUES ($1, $2, true, now()) RETURNING id",
+    )
+    .bind(&uname)
+    .bind(&display)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO user_roles (user_id, role_id) SELECT $1, id FROM roles WHERE is_default ON CONFLICT DO NOTHING")
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?;
+    let device: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO devices (user_id, install_id, name, platform) VALUES ($1, $2, $3, $4::device_platform) RETURNING id",
+    )
+    .bind(uid)
+    .bind(b.install_id)
+    .bind(&device_name)
+    .bind(auth::discord::platform(&b.platform))
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let t = auth::issue(&state, uid, Some(device), "guest", Some(ip), ua).await?;
+    tracing::info!(user = %uid, "guest sign-in");
+    Ok(Json(json!({
+        "access_token": t.access_token, "refresh_token": t.refresh_token, "device_id": device,
+        "me": routes::me::load_me(&state.db, uid).await?,
+    })))
+}
+
+#[derive(Deserialize)]
 struct RefreshBody {
     refresh_token: String,
 }
@@ -316,6 +378,14 @@ async fn housekeeping(state: AppState) {
             .execute(&state.db)
             .await?;
             sqlx::query("DELETE FROM invites WHERE expires_at < now() - interval '7 days'").execute(&state.db).await?;
+            // Guests nobody can sign in as any more (signed out, or switched to Discord).
+            sqlx::query(
+                "DELETE FROM users u WHERE u.is_guest AND u.created_at < now() - interval '1 day'
+                   AND NOT EXISTS (SELECT 1 FROM auth_sessions s WHERE s.user_id = u.id
+                                   AND s.revoked_at IS NULL AND s.rotated_at IS NULL AND s.expires_at > now())",
+            )
+            .execute(&state.db)
+            .await?;
             sqlx::query("UPDATE connection_requests SET status = 'expired' WHERE status = 'pending' AND expires_at < now()")
                 .execute(&state.db)
                 .await?;

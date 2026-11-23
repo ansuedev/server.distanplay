@@ -4,9 +4,11 @@
 //!   Bearer`. Cheap to check, short-lived so a leak is contained.
 //! - **Refresh token**: 32 random bytes, stored by the app in the OS keychain (macOS
 //!   Keychain / Windows Credential Manager) and only as a SHA-256 hash here. Every
-//!   refresh rotates it; the expiry slides 90 days from last use, so an app that's used
-//!   stays signed in indefinitely. Re-using a rotated token revokes the whole sign-in
-//!   (theft detection), as recommended by the OAuth 2.0 Security BCP.
+//!   refresh rotates it; the expiry slides a year from last use, so an app that's used
+//!   stays signed in until the user signs out. Re-using a rotated token revokes the
+//!   whole sign-in (theft detection), as recommended by the OAuth 2.0 Security BCP —
+//!   except a retry of the latest exchange (lost reply, or two requests racing), which
+//!   gets a fresh token instead of signing the app out.
 //! - Each request also checks that the sign-in (token family) hasn't been revoked and
 //!   the account is active, so sign-out and suspensions apply immediately.
 
@@ -27,7 +29,7 @@ use crate::AppState;
 use crate::error::{ApiError, ApiResult};
 
 pub const ACCESS_TTL: Duration = Duration::minutes(15);
-pub const REFRESH_IDLE: Duration = Duration::days(90);
+pub const REFRESH_IDLE: Duration = Duration::days(365);
 
 pub fn random_token(prefix: &str) -> String {
     let mut b = [0u8; 32];
@@ -112,6 +114,7 @@ struct SessionRow {
     auth_method: String,
     expires_at: DateTime<Utc>,
     rotated_at: Option<DateTime<Utc>>,
+    replaced_by: Option<Uuid>,
     revoked_at: Option<DateTime<Utc>>,
     user_status: String,
 }
@@ -121,7 +124,7 @@ pub async fn refresh(state: &AppState, token: &str, ip: Option<std::net::IpAddr>
     let mut tx = state.db.begin().await?;
     let row: Option<SessionRow> = sqlx::query_as(
         "SELECT s.id, s.family_id, s.user_id, s.device_id, s.auth_method::text AS auth_method, s.expires_at,
-                s.rotated_at, s.revoked_at, u.status::text AS user_status
+                s.rotated_at, s.replaced_by, s.revoked_at, u.status::text AS user_status
          FROM auth_sessions s JOIN users u ON u.id = s.user_id
          WHERE s.refresh_token_hash = $1
          FOR UPDATE OF s",
@@ -132,6 +135,28 @@ pub async fn refresh(state: &AppState, token: &str, ip: Option<std::net::IpAddr>
     let Some(s) = row else { return Err(ApiError::Unauthorized) };
 
     if s.rotated_at.is_some() && s.revoked_at.is_none() {
+        // The token this one was exchanged for has never been used: the app never got
+        // the reply (network drop, app closed mid-request) or sent two refreshes at
+        // once. It's still the newest token the app can have, so retire the unused one
+        // and hand out a fresh pair instead of signing the app out.
+        let unused_successor = match s.replaced_by {
+            Some(next) => sqlx::query_scalar::<_, bool>(
+                "SELECT rotated_at IS NULL AND revoked_at IS NULL FROM auth_sessions WHERE id = $1 FOR UPDATE",
+            )
+            .bind(next)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false),
+            None => false,
+        };
+        if let (true, Some(next)) = (unused_successor, s.replaced_by) {
+            sqlx::query("UPDATE auth_sessions SET revoked_at = now(), revoke_reason = 'superseded' WHERE id = $1")
+                .bind(next)
+                .execute(&mut *tx)
+                .await?;
+            tracing::info!(user = %s.user_id, family = %s.family_id, "refresh retried: reissued");
+            return issue_rotation(state, tx, &s, ip, ua).await;
+        }
         // A token that was already exchanged is being used again: someone has a copy.
         sqlx::query("UPDATE auth_sessions SET revoked_at = now(), revoke_reason = 'refresh_reuse' WHERE family_id = $1 AND revoked_at IS NULL")
             .bind(s.family_id)
@@ -145,7 +170,20 @@ pub async fn refresh(state: &AppState, token: &str, ip: Option<std::net::IpAddr>
     if s.revoked_at.is_some() || s.expires_at < Utc::now() || s.user_status != "active" {
         return Err(ApiError::Unauthorized);
     }
+    issue_rotation(state, tx, &s, ip, ua).await
+}
 
+/// Marks `s` as exchanged and issues the next refresh token of its sign-in.
+async fn issue_rotation(
+    state: &AppState,
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    s: &SessionRow,
+    ip: Option<std::net::IpAddr>,
+    ua: Option<&str>,
+) -> ApiResult<Tokens> {
+    if s.expires_at < Utc::now() || s.user_status != "active" {
+        return Err(ApiError::Unauthorized);
+    }
     let new_refresh = random_token("dpr_");
     let new_id = Uuid::now_v7();
     sqlx::query("UPDATE auth_sessions SET rotated_at = now(), replaced_by = $2, last_used_at = now() WHERE id = $1")

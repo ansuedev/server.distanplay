@@ -29,6 +29,8 @@ pub struct MeResponse {
     pub created_at: DateTime<Utc>,
     pub roles: Vec<String>,
     pub permissions: Vec<String>,
+    /// Using the app without an account (code / link only, no friends).
+    pub guest: bool,
 }
 
 pub async fn load_me(db: &PgPool, user_id: Uuid) -> ApiResult<MeResponse> {
@@ -40,9 +42,10 @@ pub async fn load_me(db: &PgPool, user_id: Uuid) -> ApiResult<MeResponse> {
         email: Option<String>,
         avatar_url: Option<String>,
         created_at: DateTime<Utc>,
+        is_guest: bool,
     }
     let u: Row = sqlx::query_as(
-        "SELECT id, username::text AS username, display_name, email::text AS email, avatar_url, created_at FROM users WHERE id = $1",
+        "SELECT id, username::text AS username, display_name, email::text AS email, avatar_url, created_at, is_guest FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(db)
@@ -72,6 +75,7 @@ pub async fn load_me(db: &PgPool, user_id: Uuid) -> ApiResult<MeResponse> {
         created_at: u.created_at,
         roles,
         permissions,
+        guest: u.is_guest,
     })
 }
 
@@ -245,7 +249,7 @@ pub async fn find_user(
     Path(name): Path<String>,
 ) -> ApiResult<Json<PublicUser>> {
     let u: Option<PublicUser> = sqlx::query_as(
-        "SELECT id, username::text AS username, display_name, avatar_url FROM users WHERE username = $1 AND status = 'active'",
+        "SELECT id, username::text AS username, display_name, avatar_url FROM users WHERE username = $1 AND status = 'active' AND NOT is_guest",
     )
     .bind(name.trim().trim_start_matches('@').to_lowercase())
     .fetch_optional(&state.db)
